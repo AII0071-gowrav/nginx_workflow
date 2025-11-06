@@ -1,0 +1,11 @@
+# dependencies
+node_modules/
+
+# build output
+frontend/build/
+backend/node_modules/
+frontend/node_modules/
+
+# Docker
+*.log
+.env
