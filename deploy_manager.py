@@ -40,7 +40,10 @@ def run_shell(command: str):
     print(f"\n$ {command}")
     try:
         # Use subprocess.run to execute the command and capture/display output
-        subprocess.run(command, shell=True, check=True, text=True, stderr=subprocess.PIPE)
+        result = subprocess.run(command, shell=True, check=True, text=True, capture_output=True)
+        print(result.stdout)
+        if result.stderr:
+            print(f"Stderr: {result.stderr}")
     except subprocess.CalledProcessError as e:
         print(f"ERROR: Command failed with exit code {e.returncode}.")
         print(f"Stderr: {e.stderr}")
@@ -50,11 +53,11 @@ def get_ports(state: Dict[str, Any], port_pool: List[int]) -> tuple[int, int]:
     """Determines the current green deploy port and the current live port."""
     max_slots = len(port_pool)
     
-    # 1. Determine next GREEN port
+    # 1. Determine next GREEN port (for the new deployment)
     next_deploy_index = int(state.get("next_deploy_slot_index", 0))
     current_deploy_port = port_pool[next_deploy_index % max_slots] # Ensure we stay in bounds
     
-    # 2. Determine current LIVE port
+    # 2. Determine current LIVE port (the one currently serving traffic)
     live_slot_index = state.get("live_slot_index")
     live_port = port_pool[int(live_slot_index)] if live_slot_index is not None else None
     
@@ -72,14 +75,15 @@ def deploy_new_version(args, current_deploy_port: int):
     
     # 1. Cleanup Old Slot (Must be targeted, use the assigned port)
     print("Cleanup: Attempting to take down old services on this slot...")
-    run_shell(f"docker compose -p {project_name} down --rmi all || true") # `|| true` to not fail if project doesn't exist
+    # Using 'docker compose down' with a project name is idempotent, but we add || true to be safe
+    run_shell(f"docker compose -p {project_name} down --rmi all --volumes --remove-orphans || true") 
 
-    # 2. Prepare Docker Compose (Modify the host port binding)
-    print("Prep: Modifying docker-compose.yml to expose Nginx on the new host port.")
+    # 2. Prepare Docker Compose (Modify the host port binding in the docker-compose.yml file)
+    print(f"Prep: Modifying docker-compose.yml to expose Nginx on host port {current_deploy_port}.")
     # This sed command assumes 'docker-compose.yml' in the current directory
-    # It finds lines like '  ports: ["OLD_PORT:80"]' and replaces 'OLD_PORT' with 'current_deploy_port'
-    run_shell(f"sed -i 's/^\\(\\s*ports:\\s*\\-\\s*\\\"\\)[0-9]*:\\([0-9]*\\\"\\)/\\1{current_deploy_port}:\\2/g' docker-compose.yml")
-
+    # It finds lines like '  - "OLD_PORT:80"' and replaces 'OLD_PORT' with 'current_deploy_port'
+    # This is critical for dynamically assigning the host port for Nginx.
+    run_shell(f"sed -i 's/^\\(\\s*\\-\\s*\\\"\\)[0-9]*:\\([0-9]*\\\"\\)/\\1{current_deploy_port}:\\2/g' docker-compose.yml")
 
     # 3. Build & Deploy (The core action)
     print(f"Build: Running docker compose up -d --build with unique project name...")
@@ -87,7 +91,7 @@ def deploy_new_version(args, current_deploy_port: int):
     
     # 4. Health Check (The quality gate)
     print(f"Health Check: Waiting 10s then checking status code for {health_url}...")
-    time.sleep(10)
+    time.sleep(10) # Give containers time to start
     
     curl_command = (
         f"STATUS=$(curl -o /dev/null -s -w '%{{http_code}}\\n' --max-time 15 {health_url} || echo '000'); "
@@ -124,26 +128,23 @@ def rollback_on_failure(args, failed_deploy_port: int):
     Handles the rollback procedure when a *new* deployment fails its health check.
     This means the old LIVE version is still active and the state file hasn't been updated.
     """
-    state = read_state()
+    state = read_state() # Read current state, which should still point to the old live
     port_pool = [int(p) for p in args.port_pool_str.split(',')]
     
     print(f"--- Initiating Rollback for failed deployment on port {failed_deploy_port} ---")
 
-    # If the new deployment failed its health check, the 'live_slot_index' in the state file
-    # still points to the PREVIOUSLY ACTIVE version. We just need to clean up the failed one.
-    
     old_live_index = state.get("live_slot_index")
     if old_live_index is not None:
         old_live_port = port_pool[int(old_live_index)]
-        old_live_version = state["active_slots"].get(str(old_live_port))
-        print(f"Previous LIVE version {old_live_version} on port {old_live_port} is still active. No state change needed for rollback.")
+        old_live_version = state["active_slots"].get(str(old_live_port), "UNKNOWN")
+        print(f"Previous LIVE version '{old_live_version}' on port {old_live_port} is still active. No state change needed for rollback.")
     else:
-        # This occurs on the very first deployment if it fails. No rollback target.
         print("This was the first deployment attempt and it failed. No previous version to roll back to.")
         
     # Always clean up the failed deploy project.
     print(f"Cleanup: Removing failed deployment project '{args.project_name}-{failed_deploy_port}'...")
-    run_shell(f"docker compose -p {args.project_name}-{failed_deploy_port} down --rmi all || true")
+    # Use --volumes and --remove-orphans for thorough cleanup
+    run_shell(f"docker compose -p {args.project_name}-{failed_deploy_port} down --rmi all --volumes --remove-orphans || true")
     print("Rollback/Cleanup complete. Previous state is preserved.")
 
 
@@ -151,19 +152,34 @@ def rollback_on_failure(args, failed_deploy_port: int):
 
 def main():
     parser = argparse.ArgumentParser(description="Unified N-Green Deployment Manager (Python).")
-    parser.add_argument("--action", required=True, help="Action to perform ('deploy').")
-    parser.add_argument("--version", required=True, help="Version string for the deployment (e.g., v1.0.0).")
-    parser.add_argument("--expected-status", required=True, type=str, help="Expected HTTP status code for health checks (e.g., '200').")
-    parser.add_argument("--rollback-target", default="", help="Specific version to rollback to. Leave empty for instant N-Green to previous live.")
+    parser.add_argument("--action", required=True, help="Action to perform ('deploy', 'rollback').")
+    parser.add_argument("--version", required=False, help="Version string for the deployment/rollback (e.g., v1.0.0). Required for 'deploy'.")
+    parser.add_argument("--expected-status", required=False, type=str, help="Expected HTTP status code for health checks (e.g., '200'). Required for 'deploy'.")
+    parser.add_argument("--rollback-target-version", default="", help="Specific version to rollback to. Used with action 'rollback'. Leave empty for instant N-Green to previous live.")
     parser.add_argument("--project-name", required=True, help="Base name for Docker Compose projects (e.g., 'nginx_workflow').")
     parser.add_argument("--port-pool-str", required=True, help="Comma-separated string of ports available for deployment (e.g., '5000,5001,5002,5003').")
     
     args = parser.parse_args()
     
+    # Validate arguments based on action
+    if args.action == "deploy":
+        if not args.version or not args.expected_status:
+            parser.error("--version and --expected-status are required for 'deploy' action.")
+    elif args.action == "rollback" and not args.rollback_target_version:
+        # For 'rollback', if no target version is given, it means 'rollback to previous live'
+        pass 
+    elif args.action == "rollback" and args.rollback_target_version:
+        # For 'rollback' with a target, nothing extra needed here.
+        pass
+    else:
+        parser.error(f"Invalid action: {args.action}")
+
+
     try:
+        port_pool = [int(p) for p in args.port_pool_str.split(',')]
+        state = read_state()
+
         if args.action == "deploy":
-            port_pool = [int(p) for p in args.port_pool_str.split(',')]
-            state = read_state()
             current_deploy_port, live_port = get_ports(state, port_pool)
             
             # 1. Attempt Deployment and Health Check
@@ -174,27 +190,92 @@ def main():
             
             print("\nDeployment SUCCESSFUL and state updated.")
 
-        # This part will be expanded for other actions like 'rollback' for specific scenarios,
-        # but for deploy failures, the rollback logic is tied to the exception handling.
-        elif args.action == "rollback_force": # Example for a separate rollback action (not for deploy failure)
-            # This would be a user-initiated rollback outside of a deploy failure
-            pass
+        elif args.action == "rollback":
+            print(f"--- Initiating Manual Rollback ---")
+            
+            target_version = args.rollback_target_version
+
+            if target_version:
+                # Rollback to a SPECIFIC version
+                if target_version not in state["version_to_port_map"]:
+                    raise ValueError(f"Rollback target version '{target_version}' not found in deployment history.")
+                
+                target_port = state["version_to_port_map"][target_version]
+                target_slot_index = port_pool.index(target_port)
+                
+                print(f"Rolling back to version '{target_version}' on port {target_port} (slot index {target_slot_index}).")
+                
+                # Perform a health check on the target port BEFORE switching.
+                # If the target is not healthy, we cannot rollback to it.
+                health_url = f"http://localhost:{target_port}/api/message"
+                print(f"Performing health check on rollback target: {health_url}")
+                curl_command = (
+                    f"STATUS=$(curl -o /dev/null -s -w '%{{http_code}}\\n' --max-time 15 {health_url} || echo '000'); "
+                    f"echo 'Response Status Code: $STATUS'; "
+                    f"if [ \"$STATUS\" != \"200\" ]; then exit 1; fi;" # Assume 200 for rollback health check
+                )
+                run_shell(curl_command) # If health check fails, script fails
+
+                # If health check passes, update state to make the target version live
+                state["live_slot_index"] = target_slot_index
+                state["next_deploy_slot_index"] = (target_slot_index + 1) % len(port_pool)
+                
+                write_state(state)
+                print(f"Manual rollback to version '{target_version}' on port {target_port} SUCCESSFUL.")
+                
+            else:
+                # Rollback to INSTANT PREVIOUS LIVE version
+                current_live_index = state.get("live_slot_index")
+                if current_live_index is None:
+                    raise ValueError("Cannot perform rollback: No active live deployment found.")
+
+                previous_live_slot_index = (current_live_index - 1 + len(port_pool)) % len(port_pool)
+                previous_live_port = port_pool[previous_live_slot_index]
+                previous_live_version = state["active_slots"].get(str(previous_live_port))
+
+                if not previous_live_version:
+                    raise ValueError(f"Cannot find a previous active version to rollback to in slot {previous_live_slot_index}.")
+                
+                print(f"Rolling back to instant previous live: Version '{previous_live_version}' on port {previous_live_port}.")
+                
+                # Perform health check on the target port BEFORE switching.
+                health_url = f"http://localhost:{previous_live_port}/api/message"
+                print(f"Performing health check on rollback target: {health_url}")
+                curl_command = (
+                    f"STATUS=$(curl -o /dev/null -s -w '%{{http_code}}\\n' --max-time 15 {health_url} || echo '000'); "
+                    f"echo 'Response Status Code: $STATUS'; "
+                    f"if [ \"$STATUS\" != \"200\" ]; then exit 1; fi;"
+                )
+                run_shell(curl_command) # If health check fails, script fails
+
+                # If health check passes, update state
+                state["live_slot_index"] = previous_live_slot_index
+                state["next_deploy_slot_index"] = (previous_live_slot_index + 1) % len(port_pool)
+
+                write_state(state)
+                print(f"Instant rollback to previous live version '{previous_live_version}' SUCCESSFUL.")
+                
 
     except Exception as e:
-        print(f"\n--- FATAL DEPLOYMENT FAILURE ---")
+        print(f"\n--- FATAL DEPLOYMENT/ROLLBACK FAILURE ---")
         print(f"Reason: {e}")
         
-        # On failure during deploy_new_version, attempt to rollback/cleanup the failed slot
-        try:
-            port_pool = [int(p) for p in args.port_pool_str.split(',')]
-            state = read_state()
-            current_deploy_port, _ = get_ports(state, port_pool) # Get the port that was being used for the failed deploy
-            rollback_on_failure(args, current_deploy_port)
-            
-        except Exception as rollback_e:
-            print(f"\n--- FATAL ROLLBACK/CLEANUP FAILURE ---")
-            print(f"Even cleanup failed completely: {rollback_e}")
-            
+        if args.action == "deploy":
+            # On failure during deploy_new_version, attempt to cleanup the failed slot
+            try:
+                # If the script failed *before* switch_and_update, current_deploy_port is what we were trying to deploy
+                # If it failed *after* switch_and_update (e.g., during some post-deploy step), it's more complex.
+                # For a failed 'deploy' action, assume the 'current_deploy_port' was the one that failed.
+                # We can safely get this from the state *before* it was modified or from the args.
+                
+                # Re-reading state to get the (potentially old) state and determine the port we were attempting to use
+                _, failed_deploy_port_for_cleanup = get_ports(read_state(), port_pool)
+                rollback_on_failure(args, failed_deploy_port_for_cleanup) 
+                
+            except Exception as cleanup_e:
+                print(f"\n--- FATAL CLEANUP AFTER DEPLOY FAILURE ---")
+                print(f"Even cleanup failed completely: {cleanup_e}")
+        
         # Re-raise the original error to ensure the Jenkins stage fails.
         raise
 
