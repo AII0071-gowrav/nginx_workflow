@@ -1,24 +1,41 @@
+# docker-compose.yml - CORRECTED for N-Green Strategy
+
 services:
+  # The Backend Service
   backend:
     build: ./backend
-    ports:
-      - "5000:5000"
+    # This port is INTERNAL to the Docker network.
+    # Nginx will proxy to 'backend:5000'.
+    # Only expose this if you need direct debugging from the host, otherwise 'expose' is fine.
+    expose:
+      - "5000" # Backend listens internally on 5000
     networks:
       - mynetwork
+
+  # The Frontend Service
   frontend:
     build: ./frontend
-    ports:
-      - "3000:3000"
+    # This port is INTERNAL to the Docker network.
+    # Nginx will proxy to 'frontend:3000'.
+    expose:
+      - "3000" # Frontend listens internally on 3000
     networks:
       - mynetwork
+
+  # The Nginx Gateway
   nginx:
     build: ./nginx
+    # THIS IS THE CRITICAL LINE FOR THE PYTHON SCRIPT
+    # The '5000' on the host side will be dynamically replaced by our Python script
+    # to the actual deploy port (e.g., 5000, 5001, etc.).
+    # Nginx inside its container listens on port 80.
     ports:
-      - "2294:80"
+      - "5000:80" # <--- Python script will modify '5000' to the dynamic deploy port
     depends_on:
       - frontend
       - backend
     networks:
       - mynetwork
+
 networks:
   mynetwork:
